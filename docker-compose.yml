@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  screenpop:
+    build: .
+    ports:
+      - "${PORT:-1337}:1337"
+    environment:
+      - NILEAR_BASE_URL=${NILEAR_BASE_URL}
+      - CW_CLIENT_ID=${CW_CLIENT_ID}
+      - CW_PUBLIC_API_KEY=${CW_PUBLIC_API_KEY}
+      - CW_PRIVATE_API_KEY=${CW_PRIVATE_API_KEY}
+      - CW_COMPANY_ID=${CW_COMPANY_ID}
+      - CW_BASE_URL=${CW_BASE_URL}
+      - SYNC_INTERVAL_HOURS=${SYNC_INTERVAL_HOURS:-4}
+      - PORT=1337
+    volumes:
+      - screenpop_data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:1337/health')"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  screenpop_data:
+    driver: local
