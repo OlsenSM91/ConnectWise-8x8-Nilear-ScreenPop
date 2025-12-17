@@ -877,8 +877,9 @@ async def company_info(company_id: int):
                 ticket_rows += f"""
                 <tr style="border-bottom: 1px solid #e5e7eb;">
                     <td style="padding: 12px; text-align: left;">
-                        <a href="https://app.nilear.com/mtx/{ticket_id}" target="_blank"
-                           style="color: #01aeed; text-decoration: none; font-weight: 600;">
+                        <a href="https://app.nilear.com/mtx/{ticket_id}"
+                           onclick="openTicketPopup('https://app.nilear.com/mtx/{ticket_id}'); return false;"
+                           style="color: #01aeed; text-decoration: none; font-weight: 600; cursor: pointer;">
                             #{ticket_id}
                         </a>
                     </td>
@@ -1204,6 +1205,27 @@ async def company_info(company_id: int):
                         }}
                     }} catch (error) {{
                         messageDiv.innerHTML = `<p style="color: #dd2b28; font-weight: 600;">✗ Error: ${{error.message}}</p>`;
+                    }}
+                }}
+
+                function openTicketPopup(url) {{
+                    // Calculate centered position
+                    const width = Math.min(1400, window.screen.width * 0.9);
+                    const height = Math.min(900, window.screen.height * 0.9);
+                    const left = (window.screen.width - width) / 2;
+                    const top = (window.screen.height - height) / 2;
+
+                    // Open popup window with specific features
+                    // This shares the browser session unlike iframe
+                    const popup = window.open(
+                        url,
+                        'TicketDetails',
+                        `width=${{width}},height=${{height}},left=${{left}},top=${{top}},resizable=yes,scrollbars=yes,status=yes,toolbar=no,menubar=no,location=no`
+                    );
+
+                    // Focus the popup window
+                    if (popup) {{
+                        popup.focus();
                     }}
                 }}
             </script>
