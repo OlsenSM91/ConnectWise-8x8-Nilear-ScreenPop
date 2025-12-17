@@ -25,7 +25,9 @@ from connectwise_api import (
     create_company_and_contact,
     create_ticket,
     activate_company_finance,
-    get_cw_headers as cw_get_cw_headers
+    get_cw_headers as cw_get_cw_headers,
+    get_member_by_name,
+    get_member_tickets
 )
 
 # Load environment variables
@@ -39,6 +41,19 @@ CW_COMPANY_ID = os.getenv("CW_COMPANY_ID")
 CW_BASE_URL = os.getenv("CW_BASE_URL")
 NILEAR_BASE_URL = os.getenv("NILEAR_BASE_URL", "https://mtx.link")
 SYNC_INTERVAL_HOURS = int(os.getenv("SYNC_INTERVAL_HOURS", "4"))
+
+# Internal extension mapping for technician screenpops
+INTERNAL_EXTENSIONS = {
+    "9401": ("Miguel", "Sahagun"),
+    "1337": ("Steven", "Olsen"),
+    "9405": ("Roy", "Morla"),
+    "1737": ("Brian", "Erk"),
+    "1002": ("Ed", "Saenz"),
+    "1744": ("Jessica", "James"),
+    "1001": ("Katelyn", "Erk"),
+    "1738": ("Bart", "Verwilt"),
+    "9404": ("Daniel", "Glick")
+}
 
 # Ensure data directory exists
 Path("data").mkdir(exist_ok=True)
@@ -1174,9 +1189,9 @@ async def screenpop(
     phone: Optional[str] = Query(None),
     CallerNumber: Optional[str] = Query(None)
 ):
-    """Main screenpop endpoint - checks cache for phone number"""
+    """Main screenpop endpoint - checks cache for phone number or handles internal extensions"""
     phone_number = phone or CallerNumber
-    
+
     if not phone_number:
         return HTMLResponse(
             content=error_page(
@@ -1186,11 +1201,39 @@ async def screenpop(
             ),
             status_code=400
         )
-    
+
     print(f"\n{'='*60}")
     print(f"📞 Screenpop for: {phone_number}")
     print(f"{'='*60}\n")
-    
+
+    # Check if this is an internal extension
+    if phone_number in INTERNAL_EXTENSIONS:
+        first_name, last_name = INTERNAL_EXTENSIONS[phone_number]
+        print(f"🔧 Internal extension detected: {first_name} {last_name}")
+
+        # Get member info from ConnectWise
+        member = await get_member_by_name(first_name, last_name)
+
+        if member:
+            member_id = member["id"]
+            member_identifier = member["identifier"]
+            full_name = f"{first_name} {last_name}"
+
+            print(f"✅ Found member: {full_name} (ID: {member_id}, Identifier: {member_identifier})")
+
+            # Redirect to technician tickets page
+            return RedirectResponse(url=f"/technician/{member_identifier}?name={full_name}")
+        else:
+            print(f"❌ Member not found in ConnectWise: {first_name} {last_name}")
+            return HTMLResponse(
+                content=error_page(
+                    "Technician Not Found",
+                    f"Could not find technician {first_name} {last_name} in ConnectWise",
+                    "Please contact system administrator"
+                ),
+                status_code=404
+            )
+
     normalized = normalize_phone(phone_number)
     
     # Check cache
@@ -1214,16 +1257,357 @@ async def screenpop(
         print(f"   Contact: {result['contact_name']}\n")
 
         return RedirectResponse(url=company_url)
-    
-    # Multiple matches - show selection page
-    print(f"⚠️  Multiple matches ({len(cached_results)}) - showing selection page\n")
+
+    # Multiple matches - check if they're all from the same company
+    unique_companies = set(r["company_id"] for r in cached_results)
+
+    if len(unique_companies) == 1:
+        # All contacts are from the same company
+        company_id = cached_results[0]["company_id"]
+        company_name = cached_results[0]["company_name"]
+        print(f"⚠️  Multiple contacts ({len(cached_results)}) at same company - showing contact selection\n")
+        print(f"   Company: {company_name}\n")
+        return HTMLResponse(
+            content=contact_selection_page(phone_number, company_id, company_name, cached_results),
+            status_code=200
+        )
+
+    # Multiple companies - show company selection page
+    print(f"⚠️  Multiple companies ({len(unique_companies)}) - showing company selection page\n")
     return HTMLResponse(
         content=selection_page(phone_number, cached_results),
         status_code=200
     )
 
 
+@app.get("/select-company/{company_id}")
+async def select_company(company_id: int, phone: str = Query(...)):
+    """
+    Intermediate endpoint when selecting a company from multiple companies.
+    Checks if the company has multiple contacts for this phone number.
+    """
+    normalized = normalize_phone(phone)
+    cached_results = cache.lookup(normalized)
+
+    # Filter results for the selected company
+    company_contacts = [r for r in cached_results if r["company_id"] == company_id]
+
+    if not company_contacts:
+        return HTMLResponse(
+            content=error_page(
+                "No Contacts Found",
+                f"No contacts found for this company with phone {phone}",
+                "The data may have been updated. Please try searching again."
+            ),
+            status_code=404
+        )
+
+    company_name = company_contacts[0]["company_name"]
+
+    # If single contact for this company, redirect to company page
+    if len(company_contacts) == 1:
+        print(f"✅ Single contact for company {company_id} - redirecting to company page")
+        return RedirectResponse(url=f"/company/{company_id}")
+
+    # Multiple contacts for this company - show contact selection
+    print(f"⚠️  Multiple contacts ({len(company_contacts)}) for company {company_id} - showing contact selection")
+    return HTMLResponse(
+        content=contact_selection_page(phone, company_id, company_name, company_contacts),
+        status_code=200
+    )
+
+
+@app.get("/technician/{member_identifier}")
+async def technician_tickets(member_identifier: str, name: str = Query(...)):
+    """
+    Display assigned tickets for a technician/member
+    """
+    try:
+        # Get tickets assigned to this technician
+        tickets = await get_member_tickets(member_identifier, status_filter="open", limit=50)
+
+        return HTMLResponse(
+            content=technician_tickets_page(member_identifier, name, tickets),
+            status_code=200
+        )
+
+    except Exception as e:
+        print(f"Error in technician_tickets: {str(e)}")
+        return HTMLResponse(
+            content=error_page(
+                "Error Loading Tickets",
+                f"An error occurred while loading tickets for {name}",
+                str(e)
+            ),
+            status_code=500
+        )
+
+
 # HTML page generators
+
+def contact_selection_page(phone_number: str, company_id: int, company_name: str, contacts: List[Dict]) -> str:
+    """Generate selection page for multiple contacts at the same company"""
+
+    # Generate contact rows
+    contact_rows = ""
+    for contact in contacts:
+        contact_name = contact["contact_name"]
+        contact_type = contact["contact_type"]
+        contact_id = contact["contact_id"]
+
+        contact_rows += f"""
+        <tr style="border-bottom: 1px solid #e5e7eb;">
+            <td style="padding: 15px;">
+                <strong style="font-size: 16px;">{contact_name}</strong>
+            </td>
+            <td style="padding: 15px; color: #6b7280;">
+                {contact_type}
+            </td>
+            <td style="padding: 15px; text-align: right;">
+                <a href="/company/{company_id}" class="button">Select Contact →</a>
+            </td>
+        </tr>
+        """
+
+    return f"""
+    <html>
+        <head>
+            <title>CNS4U - Select Contact</title>
+            <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600&family=Lato:wght@700&display=swap" rel="stylesheet">
+            <style>
+                body {{
+                    font-family: 'Poppins', sans-serif;
+                    max-width: 900px;
+                    margin: 0 auto;
+                    padding: 0;
+                    background-color: #f4f4f4;
+                }}
+                .header {{
+                    background: #545454;
+                    padding: 20px 40px;
+                    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+                }}
+                .logo {{
+                    max-width: 300px;
+                    height: auto;
+                }}
+                .container {{
+                    background: white;
+                    padding: 40px;
+                    box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+                }}
+                h1 {{
+                    color: #333333;
+                    font-family: 'Lato', sans-serif;
+                    font-weight: 700;
+                    margin-top: 0;
+                }}
+                .phone {{
+                    font-size: 24px;
+                    font-weight: 600;
+                    color: #01aeed;
+                    margin: 20px 0;
+                }}
+                .company-name {{
+                    font-size: 20px;
+                    color: #333333;
+                    margin: 20px 0;
+                    padding: 15px;
+                    background: #f9fafb;
+                    border-left: 4px solid #01aeed;
+                    border-radius: 4px;
+                }}
+                .info {{
+                    color: #58595a;
+                    margin: 20px 0;
+                    line-height: 1.6;
+                }}
+                table {{
+                    width: 100%;
+                    border-collapse: collapse;
+                    margin-top: 30px;
+                    background: white;
+                    border: 1px solid #e5e7eb;
+                    border-radius: 8px;
+                    overflow: hidden;
+                }}
+                th {{
+                    background: #f1f1f1;
+                    padding: 15px;
+                    text-align: left;
+                    font-weight: 700;
+                    font-family: 'Lato', sans-serif;
+                    color: #333333;
+                    border-bottom: 2px solid #01aeed;
+                }}
+                tr:hover {{
+                    background: #f9fafb;
+                }}
+                .button {{
+                    display: inline-block;
+                    padding: 10px 20px;
+                    background: #01aeed;
+                    color: white;
+                    text-decoration: none;
+                    border-radius: 99px;
+                    font-weight: 600;
+                    transition: all 0.3s;
+                    white-space: nowrap;
+                }}
+                .button:hover {{
+                    background: #dd2b28;
+                    transform: translateY(-2px);
+                    box-shadow: 0 4px 12px rgba(1, 174, 237, 0.3);
+                }}
+                .actions {{
+                    margin-top: 30px;
+                    padding-top: 20px;
+                    border-top: 1px solid #e5e7eb;
+                }}
+                .btn-secondary {{
+                    display: inline-block;
+                    padding: 10px 20px;
+                    background: #58595a;
+                    color: white;
+                    text-decoration: none;
+                    border-radius: 99px;
+                    font-weight: 600;
+                    transition: all 0.3s;
+                    margin-right: 10px;
+                }}
+                .btn-secondary:hover {{
+                    background: #333333;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <img src="/static/logo-darkbg.png" alt="CNS4U Logo" class="logo" onerror="this.style.display='none'">
+            </div>
+            <div class="container">
+                <h1>Multiple Contacts Found</h1>
+                <div class="phone">{phone_number}</div>
+                <div class="company-name">
+                    <strong>Company:</strong> {company_name}
+                </div>
+                <p class="info">
+                    This phone number is associated with <strong>{len(contacts)} contacts</strong> at this company.
+                    Please select which contact this call is for:
+                </p>
+
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Contact Name</th>
+                            <th>Phone Type</th>
+                            <th style="text-align: right;">Action</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {contact_rows}
+                    </tbody>
+                </table>
+
+                <div class="actions">
+                    <button onclick="showNewContactForm()" class="button">Create New Contact</button>
+                    <a href="/company/{company_id}" class="btn-secondary">View Company Details</a>
+                    <a href="/" class="btn-secondary">Back to Home</a>
+                </div>
+
+                <!-- Create New Contact Form (Hidden by default) -->
+                <div id="new-contact-section" style="display: none; margin-top: 30px; padding: 30px; background: #f9fafb; border-radius: 8px; border: 2px solid #01aeed;">
+                    <h3 style="color: #333333; font-family: 'Lato', sans-serif; margin-top: 0;">Create New Contact</h3>
+                    <p style="color: #58595a;">Company: <strong>{company_name}</strong></p>
+
+                    <form id="new-contact-form" onsubmit="submitNewContact(event)">
+                        <input type="hidden" name="company_id" value="{company_id}">
+                        <input type="hidden" name="phone" value="{phone_number}">
+
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+                            <div style="margin-bottom: 15px;">
+                                <label style="display: block; margin-bottom: 8px; font-weight: 600; color: #333333;">First Name *</label>
+                                <input type="text" name="first_name" required style="width: 100%; padding: 10px; border: 1px solid #e5e7eb; border-radius: 6px; font-family: 'Poppins', sans-serif;">
+                            </div>
+                            <div style="margin-bottom: 15px;">
+                                <label style="display: block; margin-bottom: 8px; font-weight: 600; color: #333333;">Last Name *</label>
+                                <input type="text" name="last_name" required style="width: 100%; padding: 10px; border: 1px solid #e5e7eb; border-radius: 6px; font-family: 'Poppins', sans-serif;">
+                            </div>
+                        </div>
+
+                        <div style="margin-bottom: 15px;">
+                            <label style="display: block; margin-bottom: 8px; font-weight: 600; color: #333333;">Phone Number *</label>
+                            <input type="text" value="{phone_number}" readonly style="width: 100%; padding: 10px; border: 1px solid #e5e7eb; border-radius: 6px; background: #f9fafb; font-family: 'Poppins', sans-serif;">
+                        </div>
+
+                        <div style="margin-bottom: 15px;">
+                            <label style="display: block; margin-bottom: 8px; font-weight: 600; color: #333333;">Email</label>
+                            <input type="email" name="email" style="width: 100%; padding: 10px; border: 1px solid #e5e7eb; border-radius: 6px; font-family: 'Poppins', sans-serif;">
+                        </div>
+
+                        <div style="margin-bottom: 15px;">
+                            <label style="display: block; margin-bottom: 8px; font-weight: 600; color: #333333;">Phone Type</label>
+                            <select name="phone_type" style="width: 100%; padding: 10px; border: 1px solid #e5e7eb; border-radius: 6px; font-family: 'Poppins', sans-serif;">
+                                <option value="Cell">Cell</option>
+                                <option value="Direct">Direct</option>
+                                <option value="Mobile">Mobile</option>
+                                <option value="Phone">Phone</option>
+                            </select>
+                        </div>
+
+                        <div style="display: flex; gap: 15px;">
+                            <button type="submit" class="button">Create Contact</button>
+                            <button type="button" onclick="hideNewContactForm()" class="btn-secondary">Cancel</button>
+                        </div>
+                    </form>
+                    <div id="contact-message" style="margin-top: 20px;"></div>
+                </div>
+            </div>
+
+            <script>
+                function showNewContactForm() {{
+                    document.getElementById('new-contact-section').style.display = 'block';
+                    document.getElementById('new-contact-section').scrollIntoView({{ behavior: 'smooth' }});
+                }}
+
+                function hideNewContactForm() {{
+                    document.getElementById('new-contact-section').style.display = 'none';
+                    document.getElementById('new-contact-form').reset();
+                    document.getElementById('contact-message').innerHTML = '';
+                }}
+
+                async function submitNewContact(event) {{
+                    event.preventDefault();
+                    const form = event.target;
+                    const formData = new FormData(form);
+                    const messageDiv = document.getElementById('contact-message');
+
+                    messageDiv.innerHTML = '<p style="color: #01aeed;">Creating contact...</p>';
+
+                    try {{
+                        const response = await fetch('/api/contacts/create', {{
+                            method: 'POST',
+                            body: formData
+                        }});
+
+                        const result = await response.json();
+
+                        if (result.success) {{
+                            messageDiv.innerHTML = `<p style="color: #6bb545; font-weight: 600;">✓ Contact created successfully! Redirecting...</p>`;
+                            setTimeout(() => {{
+                                window.location.href = '/company/{company_id}';
+                            }}, 1500);
+                        }} else {{
+                            messageDiv.innerHTML = `<p style="color: #dd2b28; font-weight: 600;">✗ ${{result.message}}</p>`;
+                        }}
+                    }} catch (error) {{
+                        messageDiv.innerHTML = `<p style="color: #dd2b28; font-weight: 600;">✗ Error: ${{error.message}}</p>`;
+                    }}
+                }}
+            </script>
+        </body>
+    </html>
+    """
+
 
 def selection_page(phone_number: str, results: List[Dict]) -> str:
     """Generate selection page for multiple matches"""
@@ -1248,14 +1632,14 @@ def selection_page(phone_number: str, results: List[Dict]) -> str:
             for c in company_data["contacts"]
         ])
 
-        company_url = f"/company/{company_id}"
+        company_url = f"/select-company/{company_id}?phone={phone_number}"
 
         rows_html += f"""
         <tr>
             <td><strong>{company_data['name']}</strong></td>
             <td style="font-size: 14px; color: #6b7280;">{contacts_list}</td>
             <td>
-                <a href="{company_url}" class="button">Open Company →</a>
+                <a href="{company_url}" class="button">Select Company →</a>
             </td>
         </tr>
         """
@@ -1367,6 +1751,220 @@ def selection_page(phone_number: str, results: List[Dict]) -> str:
                 </table>
             </div>
         </body>
+    </html>
+    """
+
+
+def technician_tickets_page(member_identifier: str, name: str, tickets: List[Dict]) -> str:
+    """Generate page showing technician's assigned tickets"""
+
+    # Build ticket rows HTML
+    ticket_rows = ""
+    if tickets:
+        for ticket in tickets:
+            ticket_id = ticket.get("id", "N/A")
+            summary = ticket.get("summary", "No summary")
+            status = ticket.get("status", {}).get("name", "Unknown")
+            priority = ticket.get("priority", {}).get("name", "Normal")
+            board = ticket.get("board", {}).get("name", "Unknown")
+            company = ticket.get("company", {}).get("name", "Unknown")
+
+            # Priority badge color mapping
+            priority_color = {
+                "Priority 1 - Emergency Response": "#dc2626",
+                "Priority 2 - Quick Response": "#ea580c",
+                "Priority 3 - Normal Response": "#eab308",
+                "Priority 4 - Schedule Maintenance": "#3b82f6",
+                "Priority 5 - Next Time": "#10b981",
+                "Do Not Respond": "#9333ea"
+            }.get(priority, "#eab308")
+
+            # Status color
+            status_color = "#10b981" if "new" in status.lower() else "#58595a"
+
+            ticket_rows += f"""
+            <tr style="border-bottom: 1px solid #e5e7eb;">
+                <td style="padding: 12px; text-align: left;">
+                    <a href="https://app.nilear.com/mtx/{ticket_id}" target="_blank"
+                       style="color: #01aeed; text-decoration: none; font-weight: 600;">
+                        #{ticket_id}
+                    </a>
+                </td>
+                <td style="padding: 12px; text-align: left;">{summary[:80]}{'...' if len(summary) > 80 else ''}</td>
+                <td style="padding: 12px; text-align: left;">{company}</td>
+                <td style="padding: 12px; text-align: center; white-space: nowrap;">
+                    <span style="background: {priority_color}; color: white; padding: 6px 12px; border-radius: 99px; font-size: 11px; font-weight: 600; display: inline-block; white-space: nowrap;">
+                        {priority}
+                    </span>
+                </td>
+                <td style="padding: 12px; text-align: center; white-space: nowrap;">
+                    <span style="background: {status_color}; color: white; padding: 6px 12px; border-radius: 99px; font-size: 11px; font-weight: 600; display: inline-block;">
+                        {status}
+                    </span>
+                </td>
+                <td style="padding: 12px; text-align: left;">{board}</td>
+            </tr>
+            """
+    else:
+        ticket_rows = """
+        <tr>
+            <td colspan="6" style="padding: 24px; text-align: center; color: #6b7280;">
+                No open tickets assigned to you
+            </td>
+        </tr>
+        """
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>CNS4U - {name} Tickets</title>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600&family=Lato:wght@700&display=swap" rel="stylesheet">
+        <style>
+            * {{
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }}
+            body {{
+                font-family: 'Poppins', sans-serif;
+                background: #f4f4f4;
+                min-height: 100vh;
+                padding: 0;
+            }}
+            .logo-header {{
+                background: #545454;
+                padding: 15px 30px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            }}
+            .logo {{
+                max-width: 250px;
+                height: auto;
+            }}
+            .container {{
+                max-width: 1400px;
+                margin: 0 auto;
+                background: white;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+            }}
+            .header {{
+                background: #01aeed;
+                color: white;
+                padding: 30px;
+                border-bottom: 4px solid #dd2b28;
+            }}
+            .header h1 {{
+                font-size: 28px;
+                margin-bottom: 10px;
+                font-family: 'Lato', sans-serif;
+                font-weight: 700;
+            }}
+            .tech-info {{
+                padding: 20px 30px;
+                background: #f9fafb;
+                border-bottom: 1px solid #e5e7eb;
+            }}
+            .content {{
+                padding: 30px;
+            }}
+            .section-title {{
+                font-size: 20px;
+                font-weight: 700;
+                font-family: 'Lato', sans-serif;
+                color: #333333;
+                margin-bottom: 20px;
+                padding-bottom: 10px;
+                border-bottom: 3px solid #01aeed;
+            }}
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+                background: white;
+            }}
+            th {{
+                background: #f1f1f1;
+                padding: 12px;
+                text-align: left;
+                font-weight: 700;
+                font-family: 'Lato', sans-serif;
+                color: #333333;
+                border-bottom: 2px solid #01aeed;
+            }}
+            .actions {{
+                margin-top: 30px;
+                padding-top: 20px;
+                border-top: 1px solid #e5e7eb;
+                display: flex;
+                gap: 15px;
+                flex-wrap: wrap;
+            }}
+            .btn {{
+                padding: 12px 24px;
+                border-radius: 99px;
+                text-decoration: none;
+                font-weight: 600;
+                display: inline-block;
+                transition: all 0.3s;
+            }}
+            .btn-secondary {{
+                background: #58595a;
+                color: white;
+            }}
+            .btn-secondary:hover {{
+                background: #333333;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="logo-header">
+            <img src="/static/logo-darkbg.png" alt="CNS4U Logo" class="logo" onerror="this.style.display='none'">
+        </div>
+        <div class="container">
+            <div class="header">
+                <h1>{name}'s Assigned Tickets</h1>
+                <p>Technician ID: {member_identifier}</p>
+            </div>
+
+            <div class="tech-info">
+                <div style="display: flex; align-items: center; gap: 20px;">
+                    <div>
+                        <span style="font-weight: 600; color: #333333;">Open Tickets:</span>
+                        <span style="color: #58595a; font-size: 18px; font-weight: 700; margin-left: 10px;">{len(tickets)}</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="content">
+                <h2 class="section-title">Open Tickets ({len(tickets)})</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Ticket #</th>
+                            <th>Summary</th>
+                            <th>Company</th>
+                            <th style="text-align: center;">Priority</th>
+                            <th style="text-align: center;">Status</th>
+                            <th>Board</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {ticket_rows}
+                    </tbody>
+                </table>
+
+                <div class="actions">
+                    <a href="https://app.nilear.com/mtx" target="_blank" class="btn btn-secondary">
+                        Open Nilear
+                    </a>
+                    <a href="/" class="btn btn-secondary">
+                        Back to Home
+                    </a>
+                </div>
+            </div>
+        </div>
+    </body>
     </html>
     """
 

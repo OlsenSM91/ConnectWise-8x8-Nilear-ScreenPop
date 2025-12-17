@@ -498,3 +498,96 @@ async def activate_company_finance(company_id: int) -> bool:
     except Exception as e:
         print(f"Error activating company finance: {str(e)}")
         return False
+
+
+async def get_all_members() -> List[Dict]:
+    """
+    Get all members (technicians/resources) from ConnectWise
+    Returns list of members with id, identifier, firstName, lastName
+    """
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        url = f"{CW_BASE_URL}/system/members"
+        params = {
+            "pageSize": 500,
+            "orderBy": "firstName asc",
+            "fields": "id,identifier,firstName,lastName,officeEmail,inactiveFlag"
+        }
+
+        response = await client.get(
+            url,
+            headers=get_cw_headers(),
+            params=params
+        )
+
+        if response.status_code == 200:
+            return response.json()
+        else:
+            print(f"Error getting members: {response.status_code} - {response.text}")
+            return []
+
+
+async def get_member_by_name(first_name: str, last_name: str) -> Optional[Dict]:
+    """
+    Get a member by their name
+    Returns member dict or None if not found
+    """
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        url = f"{CW_BASE_URL}/system/members"
+        params = {
+            "conditions": f"firstName='{first_name}' AND lastName='{last_name}'",
+            "pageSize": 1,
+            "fields": "id,identifier,firstName,lastName,officeEmail,inactiveFlag"
+        }
+
+        response = await client.get(
+            url,
+            headers=get_cw_headers(),
+            params=params
+        )
+
+        if response.status_code == 200:
+            members = response.json()
+            if members:
+                return members[0]
+        else:
+            print(f"Error getting member: {response.status_code} - {response.text}")
+
+        return None
+
+
+async def get_member_tickets(member_identifier: str, status_filter: str = "open", limit: int = 50) -> List[Dict]:
+    """
+    Get tickets assigned to a specific member/resource
+    member_identifier: The member's identifier (e.g., "BSahagun")
+    status_filter: "open", "all", or specific status
+    Returns list of tickets with id, summary, status, priority, company, etc.
+    """
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        url = f"{CW_BASE_URL}/service/tickets"
+
+        # Build conditions based on status filter
+        if status_filter == "open":
+            conditions = f"resources='{member_identifier}' AND closedFlag=false"
+        elif status_filter == "all":
+            conditions = f"resources='{member_identifier}'"
+        else:
+            conditions = f"resources='{member_identifier}' AND status/name='{status_filter}'"
+
+        params = {
+            "conditions": conditions,
+            "pageSize": limit,
+            "orderBy": "id desc",
+            "fields": "id,summary,status,priority,board,company,contact,dateEntered,resources,closedFlag"
+        }
+
+        response = await client.get(
+            url,
+            headers=get_cw_headers(),
+            params=params
+        )
+
+        if response.status_code == 200:
+            return response.json()
+        else:
+            print(f"Error getting member tickets: {response.status_code} - {response.text}")
+            return []
