@@ -14,7 +14,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, File
 import httpx
 from dotenv import load_dotenv
 
-from database import PhoneCache
+from database import PhoneCache, ExtensionAssignments
 from connectwise_api import (
     search_companies,
     get_company_by_id,
@@ -55,11 +55,17 @@ INTERNAL_EXTENSIONS = {
     "9404": ("Daniel", "Glick")
 }
 
+# Special cases where extension name differs from ConnectWise member name
+CONNECTWISE_NAME_OVERRIDES = {
+    "1001": ("CNS Service", "Desk")  # Katelyn Erk is "CNS Service Desk" in ConnectWise
+}
+
 # Ensure data directory exists
 Path("data").mkdir(exist_ok=True)
 
-# Initialize cache
+# Initialize cache and extension assignments
 cache = PhoneCache("data/phone_cache.db")
+extension_assignments = ExtensionAssignments("data/phone_cache.db")
 
 # Create FastAPI app
 app = FastAPI(title="8x8 Nilear Screenpop", version="2.1.0")
@@ -685,6 +691,42 @@ async def api_create_contact(
         }, status_code=500)
 
 
+@app.post("/api/extensions/assign")
+async def api_assign_extension(
+    extension: str = Form(...),
+    first_name: str = Form(...),
+    last_name: str = Form(...),
+    member_identifier: Optional[str] = Form(None)
+):
+    """Assign an extension to a technician"""
+    print(f"\n📝 Extension Assignment Request:")
+    print(f"   Extension: {extension}")
+    print(f"   First Name: {first_name}")
+    print(f"   Last Name: {last_name}")
+    print(f"   Member Identifier: {member_identifier}")
+
+    try:
+        extension_assignments.assign_extension(
+            extension=extension,
+            first_name=first_name,
+            last_name=last_name,
+            member_identifier=member_identifier
+        )
+
+        print(f"✅ Successfully assigned extension {extension} to {first_name} {last_name}")
+
+        return JSONResponse(content={
+            "success": True,
+            "message": f"Extension {extension} assigned to {first_name} {last_name}"
+        })
+    except Exception as e:
+        print(f"❌ Error assigning extension: {str(e)}")
+        return JSONResponse(content={
+            "success": False,
+            "message": f"Failed to assign extension: {str(e)}"
+        }, status_code=500)
+
+
 @app.post("/api/companies/create")
 async def api_create_company(
     name: str = Form(...),
@@ -1206,30 +1248,87 @@ async def screenpop(
     print(f"📞 Screenpop for: {phone_number}")
     print(f"{'='*60}\n")
 
-    # Check if this is an internal extension
-    if phone_number in INTERNAL_EXTENSIONS:
-        first_name, last_name = INTERNAL_EXTENSIONS[phone_number]
-        print(f"🔧 Internal extension detected: {first_name} {last_name}")
+    # Check if this is a 4-digit internal extension
+    is_internal_extension = phone_number.isdigit() and len(phone_number) == 4
 
-        # Get member info from ConnectWise
-        member = await get_member_by_name(first_name, last_name)
+    if is_internal_extension:
+        # Check database first, then fall back to hardcoded INTERNAL_EXTENSIONS
+        db_assignment = extension_assignments.get_assignment(phone_number)
 
-        if member:
-            member_id = member["id"]
-            member_identifier = member["identifier"]
-            full_name = f"{first_name} {last_name}"
+        if db_assignment or phone_number in INTERNAL_EXTENSIONS:
+            # Known extension (from database or hardcoded)
+            if db_assignment:
+                first_name = db_assignment['first_name']
+                last_name = db_assignment['last_name']
+                print(f"🔧 Internal extension detected (from database): {first_name} {last_name}")
+            else:
+                first_name, last_name = INTERNAL_EXTENSIONS[phone_number]
+                print(f"🔧 Internal extension detected (hardcoded): {first_name} {last_name}")
 
-            print(f"✅ Found member: {full_name} (ID: {member_id}, Identifier: {member_identifier})")
+            # Check if there's a ConnectWise name override
+            if phone_number in CONNECTWISE_NAME_OVERRIDES:
+                cw_first, cw_last = CONNECTWISE_NAME_OVERRIDES[phone_number]
+                print(f"   Using ConnectWise override: {cw_first} {cw_last}")
+            else:
+                cw_first, cw_last = first_name, last_name
 
-            # Redirect to technician tickets page
-            return RedirectResponse(url=f"/technician/{member_identifier}?name={full_name}")
+            # Get member info from ConnectWise
+            member = await get_member_by_name(cw_first, cw_last)
+
+            if member:
+                member_id = member["id"]
+                member_identifier = member["identifier"]
+                full_name = f"{first_name} {last_name}"
+
+                print(f"✅ Found member: {full_name} (ID: {member_id}, Identifier: {member_identifier})")
+
+                # Redirect to technician tickets page
+                return RedirectResponse(url=f"/technician/{member_identifier}?name={full_name}")
+            else:
+                print(f"❌ Member not found in ConnectWise: {cw_first} {cw_last}")
+                # Get unassigned technicians for error page
+                from connectwise_api import get_all_members
+                all_members = await get_all_members()
+                # Combine hardcoded and database-assigned names
+                assigned_names = set(INTERNAL_EXTENSIONS.values()) | extension_assignments.get_assigned_names()
+                # Filter out inactive members, assigned members, and those with missing names
+                unassigned = [
+                    m for m in all_members
+                    if (m.get('firstName'), m.get('lastName')) not in assigned_names
+                    and not m.get('inactiveFlag', False)
+                    and m.get('firstName')  # Must have first name
+                    and m.get('lastName')   # Must have last name
+                ]
+
+                return HTMLResponse(
+                    content=unassigned_technicians_error_page(
+                        phone_number,
+                        f"{first_name} {last_name}",
+                        unassigned
+                    ),
+                    status_code=404
+                )
         else:
-            print(f"❌ Member not found in ConnectWise: {first_name} {last_name}")
+            # Unknown extension - show list of unassigned technicians
+            print(f"🔧 Unknown internal extension: {phone_number}")
+            from connectwise_api import get_all_members
+            all_members = await get_all_members()
+            # Combine hardcoded and database-assigned names
+            assigned_names = set(INTERNAL_EXTENSIONS.values()) | extension_assignments.get_assigned_names()
+            # Filter out inactive members, assigned members, and those with missing names
+            unassigned = [
+                m for m in all_members
+                if (m.get('firstName'), m.get('lastName')) not in assigned_names
+                and not m.get('inactiveFlag', False)
+                and m.get('firstName')  # Must have first name
+                and m.get('lastName')   # Must have last name
+            ]
+
             return HTMLResponse(
-                content=error_page(
-                    "Technician Not Found",
-                    f"Could not find technician {first_name} {last_name} in ConnectWise",
-                    "Please contact system administrator"
+                content=unassigned_technicians_error_page(
+                    phone_number,
+                    None,
+                    unassigned
                 ),
                 status_code=404
             )
@@ -1785,8 +1884,9 @@ def technician_tickets_page(member_identifier: str, name: str, tickets: List[Dic
             ticket_rows += f"""
             <tr style="border-bottom: 1px solid #e5e7eb;">
                 <td style="padding: 12px; text-align: left;">
-                    <a href="https://app.nilear.com/mtx/{ticket_id}" target="_blank"
-                       style="color: #01aeed; text-decoration: none; font-weight: 600;">
+                    <a href="https://app.nilear.com/mtx/{ticket_id}"
+                       onclick="openTicketPopup('https://app.nilear.com/mtx/{ticket_id}'); return false;"
+                       style="color: #01aeed; text-decoration: none; font-weight: 600; cursor: pointer;">
                         #{ticket_id}
                     </a>
                 </td>
@@ -1964,69 +2064,418 @@ def technician_tickets_page(member_identifier: str, name: str, tickets: List[Dic
                 </div>
             </div>
         </div>
+
+        <script>
+            function openTicketPopup(url) {{
+                // Calculate centered position
+                const width = Math.min(1400, window.screen.width * 0.9);
+                const height = Math.min(900, window.screen.height * 0.9);
+                const left = (window.screen.width - width) / 2;
+                const top = (window.screen.height - height) / 2;
+
+                // Open popup window with specific features
+                // This shares the browser session unlike iframe
+                const popup = window.open(
+                    url,
+                    'TicketDetails',
+                    `width=${{width}},height=${{height}},left=${{left}},top=${{top}},resizable=yes,scrollbars=yes,status=yes,toolbar=no,menubar=no,location=no`
+                );
+
+                // Focus the popup window
+                if (popup) {{
+                    popup.focus();
+                }}
+            }}
+        </script>
+    </body>
+    </html>
+    """
+
+
+def unassigned_technicians_error_page(extension: str, searched_name: Optional[str], unassigned_techs: List[Dict]) -> str:
+    """Generate error page for invalid extensions showing unassigned technicians"""
+
+    tech_rows = ""
+    if unassigned_techs:
+        for tech in unassigned_techs:
+            first = tech.get('firstName', '')
+            last = tech.get('lastName', '')
+            identifier = tech.get('identifier', '')
+            email = tech.get('officeEmail', '')
+
+            tech_rows += f"""
+            <tr style="border-bottom: 1px solid #e5e7eb;">
+                <td style="padding: 12px;">{first} {last}</td>
+                <td style="padding: 12px;">{identifier}</td>
+                <td style="padding: 12px;">{email}</td>
+                <td style="padding: 12px; text-align: center;">
+                    <button class="assign-btn"
+                            data-extension="{extension}"
+                            data-firstname="{first}"
+                            data-lastname="{last}"
+                            data-identifier="{identifier}"
+                            onclick="assignExtension(this)">
+                        Assign Extension {extension}
+                    </button>
+                </td>
+            </tr>
+            """
+    else:
+        tech_rows = """
+        <tr>
+            <td colspan="4" style="padding: 24px; text-align: center; color: #6b7280;">
+                All technicians are already assigned to extensions
+            </td>
+        </tr>
+        """
+
+    search_info = f"Extension <strong>{extension}</strong> is not assigned"
+    if searched_name:
+        search_info += f" (searched for: {searched_name})"
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>CNS4U - Extension Not Found</title>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600&family=Lato:wght@700&display=swap" rel="stylesheet">
+        <style>
+            * {{
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }}
+            body {{
+                font-family: 'Poppins', sans-serif;
+                background: #f4f4f4;
+                min-height: 100vh;
+            }}
+            .header {{
+                background: #545454;
+                padding: 20px 40px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            }}
+            .logo {{
+                max-width: 300px;
+                height: auto;
+            }}
+            .container {{
+                max-width: 900px;
+                margin: 40px auto;
+                background: white;
+                border-radius: 8px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+                overflow: hidden;
+            }}
+            .error-header {{
+                background: #f59e0b;
+                color: white;
+                padding: 30px 40px;
+                border-bottom: 4px solid #d97706;
+            }}
+            .error-header h1 {{
+                font-family: 'Lato', sans-serif;
+                font-weight: 700;
+                font-size: 28px;
+                margin: 0;
+            }}
+            .content {{
+                padding: 40px;
+            }}
+            .message {{
+                color: #4b5563;
+                font-size: 18px;
+                line-height: 1.6;
+                margin-bottom: 20px;
+            }}
+            .info-box {{
+                background: #fef3c7;
+                border-left: 4px solid #f59e0b;
+                padding: 15px;
+                margin: 20px 0;
+                border-radius: 4px;
+            }}
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+                margin-top: 20px;
+                border: 1px solid #e5e7eb;
+                border-radius: 8px;
+                overflow: hidden;
+            }}
+            th {{
+                background: #f1f1f1;
+                padding: 12px;
+                text-align: left;
+                font-weight: 700;
+                font-family: 'Lato', sans-serif;
+                color: #333333;
+                border-bottom: 2px solid #01aeed;
+            }}
+            .actions {{
+                margin-top: 30px;
+                padding-top: 30px;
+                border-top: 1px solid #e5e7eb;
+            }}
+            .btn {{
+                display: inline-block;
+                padding: 12px 24px;
+                background: #01aeed;
+                color: white;
+                text-decoration: none;
+                border-radius: 99px;
+                font-weight: 600;
+                transition: all 0.3s;
+            }}
+            .btn:hover {{
+                background: #dd2b28;
+                transform: translateY(-2px);
+                box-shadow: 0 4px 12px rgba(1, 174, 237, 0.3);
+            }}
+            .assign-btn {{
+                padding: 8px 16px;
+                background: #10b981;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                font-weight: 600;
+                font-size: 14px;
+                cursor: pointer;
+                transition: all 0.3s;
+            }}
+            .assign-btn:hover {{
+                background: #059669;
+                transform: translateY(-1px);
+                box-shadow: 0 2px 8px rgba(16, 185, 129, 0.3);
+            }}
+            .assign-btn:disabled {{
+                background: #9ca3af;
+                cursor: not-allowed;
+                transform: none;
+            }}
+        </style>
+        <script>
+            async function assignExtension(button) {{
+                // Get data from button attributes
+                const extension = button.dataset.extension;
+                const firstName = button.dataset.firstname;
+                const lastName = button.dataset.lastname;
+                const identifier = button.dataset.identifier || '';
+
+                // Debug logging
+                console.log('Assignment data:', {{
+                    extension: extension,
+                    firstName: firstName,
+                    lastName: lastName,
+                    identifier: identifier
+                }});
+
+                // Validation
+                if (!extension || !firstName || !lastName) {{
+                    alert('Missing required data. Please refresh and try again.');
+                    return;
+                }}
+
+                button.disabled = true;
+                button.textContent = 'Assigning...';
+
+                try {{
+                    const formData = new FormData();
+                    formData.append('extension', extension);
+                    formData.append('first_name', firstName);
+                    formData.append('last_name', lastName);
+                    if (identifier) {{
+                        formData.append('member_identifier', identifier);
+                    }}
+
+                    console.log('Sending request to /api/extensions/assign');
+
+                    const response = await fetch('/api/extensions/assign', {{
+                        method: 'POST',
+                        body: formData
+                    }});
+
+                    console.log('Response status:', response.status);
+
+                    if (response.ok) {{
+                        const result = await response.json();
+                        if (result.success) {{
+                            button.textContent = '✓ Assigned';
+                            button.style.background = '#01aeed';
+                            setTimeout(() => {{
+                                window.location.href = '/screenpop?phone=' + extension;
+                            }}, 1000);
+                        }} else {{
+                            alert('Failed to assign extension: ' + result.message);
+                            button.disabled = false;
+                            button.textContent = 'Assign Extension ' + extension;
+                        }}
+                    }} else {{
+                        const errorText = await response.text();
+                        console.error('Server error:', errorText);
+                        alert('Server error (' + response.status + '). Check console for details.');
+                        button.disabled = false;
+                        button.textContent = 'Assign Extension ' + extension;
+                    }}
+                }} catch (error) {{
+                    console.error('Error:', error);
+                    alert('Error assigning extension: ' + error.message);
+                    button.disabled = false;
+                    button.textContent = 'Assign Extension ' + extension;
+                }}
+            }}
+        </script>
+    </head>
+    <body>
+        <div class="header">
+            <img src="/static/logo-darkbg.png" alt="CNS4U Logo" class="logo" onerror="this.style.display='none'">
+        </div>
+        <div class="container">
+            <div class="error-header">
+                <h1>⚠️ Extension Not Found</h1>
+            </div>
+            <div class="content">
+                <p class="message">{search_info}</p>
+                <div class="info-box">
+                    <strong>Note:</strong> Below are technicians in ConnectWise who don't currently have an extension assigned.
+                    Contact your system administrator to assign extension {extension} to a technician.
+                </div>
+
+                <h3 style="margin-top: 30px; margin-bottom: 15px; font-family: 'Lato', sans-serif;">Unassigned Technicians</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Name</th>
+                            <th>Identifier</th>
+                            <th>Email</th>
+                            <th style="text-align: center;">Action</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {tech_rows}
+                    </tbody>
+                </table>
+
+                <div class="actions">
+                    <a href="/" class="btn">← Back to Home</a>
+                </div>
+            </div>
+        </div>
     </body>
     </html>
     """
 
 
 def error_page(title: str, message: str, detail: str = "") -> str:
-    """Generate error page HTML"""
+    """Generate error page HTML with proper branding"""
     return f"""
+    <!DOCTYPE html>
     <html>
-        <head>
-            <style>
-                body {{
-                    font-family: Arial, sans-serif;
-                    max-width: 600px;
-                    margin: 50px auto;
-                    padding: 20px;
-                    background-color: #f5f5f5;
-                }}
-                .container {{
-                    background: white;
-                    padding: 40px;
-                    border-radius: 8px;
-                    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-                }}
-                h1 {{
-                    color: #dc2626;
-                    margin-top: 0;
-                }}
-                .message {{
-                    color: #4b5563;
-                    margin: 20px 0;
-                    line-height: 1.6;
-                }}
-                .detail {{
-                    color: #6b7280;
-                    font-size: 14px;
-                    margin-top: 20px;
-                    padding: 15px;
-                    background: #f9fafb;
-                    border-radius: 4px;
-                }}
-                a {{
-                    display: inline-block;
-                    margin-top: 20px;
-                    padding: 10px 20px;
-                    background: #667eea;
-                    color: white;
-                    text-decoration: none;
-                    border-radius: 4px;
-                }}
-                a:hover {{
-                    background: #5568d3;
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
+    <head>
+        <title>CNS4U - {title}</title>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600&family=Lato:wght@700&display=swap" rel="stylesheet">
+        <style>
+            * {{
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }}
+            body {{
+                font-family: 'Poppins', sans-serif;
+                background: #f4f4f4;
+                min-height: 100vh;
+            }}
+            .header {{
+                background: #545454;
+                padding: 20px 40px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            }}
+            .logo {{
+                max-width: 300px;
+                height: auto;
+            }}
+            .container {{
+                max-width: 800px;
+                margin: 40px auto;
+                background: white;
+                border-radius: 8px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+                overflow: hidden;
+            }}
+            .error-header {{
+                background: #dc2626;
+                color: white;
+                padding: 30px 40px;
+                border-bottom: 4px solid #991b1b;
+            }}
+            .error-header h1 {{
+                font-family: 'Lato', sans-serif;
+                font-weight: 700;
+                font-size: 28px;
+                margin: 0;
+            }}
+            .content {{
+                padding: 40px;
+            }}
+            .message {{
+                color: #4b5563;
+                font-size: 18px;
+                line-height: 1.6;
+                margin-bottom: 20px;
+            }}
+            .detail {{
+                color: #6b7280;
+                font-size: 14px;
+                padding: 20px;
+                background: #fef2f2;
+                border-left: 4px solid #dc2626;
+                border-radius: 4px;
+                margin-top: 20px;
+                font-family: monospace;
+            }}
+            .actions {{
+                margin-top: 30px;
+                padding-top: 30px;
+                border-top: 1px solid #e5e7eb;
+            }}
+            .btn {{
+                display: inline-block;
+                padding: 12px 24px;
+                background: #01aeed;
+                color: white;
+                text-decoration: none;
+                border-radius: 99px;
+                font-weight: 600;
+                transition: all 0.3s;
+            }}
+            .btn:hover {{
+                background: #dd2b28;
+                transform: translateY(-2px);
+                box-shadow: 0 4px 12px rgba(1, 174, 237, 0.3);
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <img src="/static/logo-darkbg.png" alt="CNS4U Logo" class="logo" onerror="this.style.display='none'">
+        </div>
+        <div class="container">
+            <div class="error-header">
                 <h1>⚠️ {title}</h1>
-                <p class="message">{message}</p>
-                {f'<div class="detail">{detail}</div>' if detail else ''}
-                <a href="/">← Back to Home</a>
             </div>
-        </body>
+            <div class="content">
+                <p class="message">{message}</p>
+                {f'<div class="detail"><strong>Details:</strong><br>{detail}</div>' if detail else ''}
+                <div class="actions">
+                    <a href="/" class="btn">← Back to Home</a>
+                </div>
+            </div>
+        </div>
+    </body>
     </html>
     """
 

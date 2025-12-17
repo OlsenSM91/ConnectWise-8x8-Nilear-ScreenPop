@@ -238,3 +238,100 @@ class PhoneCache:
         age_hours = (datetime.now() - oldest_dt).total_seconds() / 3600
         
         return int(age_hours)
+
+
+class ExtensionAssignments:
+    """Manages extension-to-technician assignments in SQLite"""
+
+    def __init__(self, db_path: str = "data/phone_cache.db"):
+        self.db_path = db_path
+        self.init_db()
+
+    def init_db(self):
+        """Initialize extension assignments table"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        # Create extension_assignments table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS extension_assignments (
+                extension TEXT PRIMARY KEY,
+                first_name TEXT NOT NULL,
+                last_name TEXT NOT NULL,
+                member_identifier TEXT,
+                assigned_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        conn.commit()
+        conn.close()
+
+    def assign_extension(self, extension: str, first_name: str, last_name: str, member_identifier: str = None):
+        """Assign an extension to a technician"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            INSERT OR REPLACE INTO extension_assignments
+            (extension, first_name, last_name, member_identifier, updated_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """, (extension, first_name, last_name, member_identifier))
+
+        conn.commit()
+        conn.close()
+
+    def get_assignment(self, extension: str) -> Optional[Dict]:
+        """Get the technician assigned to an extension"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT extension, first_name, last_name, member_identifier, assigned_date, updated_at
+            FROM extension_assignments
+            WHERE extension = ?
+        """, (extension,))
+
+        result = cursor.fetchone()
+        conn.close()
+
+        return dict(result) if result else None
+
+    def get_all_assignments(self) -> List[Dict]:
+        """Get all extension assignments"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT extension, first_name, last_name, member_identifier, assigned_date, updated_at
+            FROM extension_assignments
+            ORDER BY extension
+        """)
+
+        results = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+
+        return results
+
+    def remove_assignment(self, extension: str):
+        """Remove an extension assignment"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute("DELETE FROM extension_assignments WHERE extension = ?", (extension,))
+
+        conn.commit()
+        conn.close()
+
+    def get_assigned_names(self) -> set:
+        """Get set of all assigned (first_name, last_name) tuples"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT first_name, last_name FROM extension_assignments")
+        results = cursor.fetchall()
+        conn.close()
+
+        return set(results)
